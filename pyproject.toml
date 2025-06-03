@@ -1,0 +1,18 @@
+[project]
+name = "data-probe"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dask[dataframe]>=2025.5.1",
+    "distributed>=2025.5.1",
+    "fastapi[standard]>=0.115.12",
+    "pandas>=2.2.3",
+    "pydantic>=2.11.5",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+]
