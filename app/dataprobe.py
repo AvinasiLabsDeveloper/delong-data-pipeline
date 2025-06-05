@@ -298,6 +298,135 @@ def fake_data(column_data: pd.Series, n_samples: int) -> pd.Series:
         return pd.Series(fake_values, dtype=object)
 
 
+def _stat_column_data(
+        data: pd.Series
+    ) -> Dict[str, Any]:
+    """
+    Calculates statistics for a given column. First, infers the substantive data type
+    based on a sample from the head of the column, then calculates full-column statistics,
+    including min/max values, NA percentage, etc.
+    """
+    substantive_type = get_intelligent_data_type(data)
+    stats: Dict[str, Any] = {
+        "determined_type": substantive_type
+    }
+
+    # 3. Calculate Full Column Statistics using Dask operations
+    
+    # Basic counts - compute these first
+    total_count_val = data.size # Ensure it's computed if it's a Dask scalar
+    na_count_val = data.isnull().sum()
+
+
+    stats["total_count"] = int(total_count_val)
+    stats["na_count"] = int(na_count_val)
+    stats["na_percentage"] = (stats["na_count"] / stats["total_count"]) * 100 if stats["total_count"] > 0 else 0.0
+    valid_count_val = stats["total_count"] - stats["na_count"]
+    stats["valid_count"] = valid_count_val
+
+    # Unique count - use nunique_approx for potentially very large series
+    if valid_count_val > 0:
+        # Heuristic: use nunique_approx if many valid items, otherwise exact.
+        # nunique_approx is generally faster and uses less memory for high cardinality.
+        if valid_count_val > 500_000 and data.nunique_approx().compute() > 100_000 : # example threshold
+            unique_count_dask = data.nunique_approx()
+        else:
+            unique_count_dask = data.nunique()
+        stats["unique_count"] = unique_count_dask
+    else:
+        stats["unique_count"] = 0
+        
+    # Type-specific statistics
+    stat_series = data # Start with the original dask series
+
+    if substantive_type in ['int', 'float']:
+        if stat_series.dtype == 'object' or not pd.api.types.is_numeric_dtype(stat_series.dtype):
+            meta_type = float 
+            stat_series = stat_series.map_partitions(pd.to_numeric, errors='coerce', meta=(stat_series.name, meta_type))
+        
+        if valid_count_val > 0:
+            # Run all dask computations together
+            computed_numeric_stats = dd.compute(
+                stat_series.min(),
+                stat_series.max(),
+                stat_series.mean(),
+                stat_series.std(),
+                stat_series.quantile(0.5) # median
+            )
+            min_s, max_s, mean_s, std_s, median_s = computed_numeric_stats
+            
+            stats["min"] = min_s if substantive_type == 'float' else (int(round(min_s)) if pd.notna(min_s) else pd.NA)
+            stats["max"] = max_s if substantive_type == 'float' else (int(round(max_s)) if pd.notna(max_s) else pd.NA)
+            stats["mean"] = mean_s # Keep float for mean, even if type is int
+            stats["median"] = median_s if substantive_type == 'float' else (int(round(median_s)) if pd.notna(median_s) else pd.NA)
+            stats["std"] = std_s if pd.notna(std_s) else 0.0
+        else:
+            stats.update({"min": pd.NA, "max": pd.NA, "mean": pd.NA, "median": pd.NA, "std": pd.NA})
+
+    elif substantive_type == 'bool':
+        if valid_count_val > 0:
+            # value_counts() is safer for bool-like objects that might not be actual booleans yet
+            value_counts_pd = stat_series.value_counts().compute() # pd.Series
+            stats["true_count"] = int(value_counts_pd.get(True, 0))
+            stats["false_count"] = int(value_counts_pd.get(False, 0))
+            # Account for other values if not strictly bool due to object type before full conversion
+            other_bool_values = {k:v for k,v in value_counts_pd.items() if k not in [True, False]}
+            if other_bool_values:
+                stats["other_bool_like_values_counts"] = other_bool_values
+        else:
+            stats["true_count"] = 0
+            stats["false_count"] = 0
+
+    elif substantive_type == 'datetime':
+        if stat_series.dtype == 'object' or not pd.api.types.is_datetime64_any_dtype(stat_series.dtype):
+            stat_series = stat_series.map_partitions(pd.to_datetime, errors='coerce', meta=(stat_series.name, 'datetime64[ns]'))
+        
+        if valid_count_val > 0:
+            min_dt, max_dt = dd.compute(stat_series.min(), stat_series.max())
+            stats.update({"min": min_dt, "max": max_dt})
+        else:
+            stats.update({"min": pd.NaT, "max": pd.NaT})
+
+    elif substantive_type == 'timedelta':
+        if stat_series.dtype == 'object' or not pd.api.types.is_timedelta64_dtype(stat_series.dtype):
+             stat_series = stat_series.map_partitions(pd.to_timedelta, errors='coerce', meta=(stat_series.name, 'timedelta64[ns]'))
+        if valid_count_val > 0:
+            min_td, max_td = dd.compute(stat_series.min(), stat_series.max())
+            stats.update({"min": min_td, "max": max_td})
+        else:
+            stats.update({"min": pd.NaT, "max": pd.NaT})
+
+    elif substantive_type == 'str':
+        if valid_count_val > 0:
+            current_series_for_str_ops = stat_series
+            # Ensure it's treated as string for value_counts if not already (e.g. categorical)
+            if pd.api.types.is_categorical_dtype(current_series_for_str_ops.dtype):
+                current_series_for_str_ops = current_series_for_str_ops.astype(str) # Dask astype(str)
+            elif current_series_for_str_ops.dtype != 'object' and not pd.api.types.is_string_dtype(current_series_for_str_ops.dtype):
+                 # If it's numeric/bool etc but classified as str (e.g. "1", "2"), convert to string for string ops
+                current_series_for_str_ops = current_series_for_str_ops.astype(str)
+
+            # Using .astype(str) above should make .min() and .max() lexicographical
+            # and value_counts work on string representations.
+            
+            top_n_freq_dask = current_series_for_str_ops.value_counts().nlargest(5)
+            # min/max on a series cast to string will be lexicographical
+            min_lex_dask = current_series_for_str_ops.min() 
+            max_lex_dask = current_series_for_str_ops.max()
+
+            computed_str_stats = dd.compute(top_n_freq_dask, min_lex_dask, max_lex_dask)
+            top_n_freq_val, min_lex_val, max_lex_val = computed_str_stats
+            
+            stats["top_5_frequent"] = top_n_freq_val.to_dict()
+            stats["min_lexicographical"] = min_lex_val
+            stats["max_lexicographical"] = max_lex_val
+        else:
+            stats["top_5_frequent"] = {}
+            stats["min_lexicographical"] = pd.NA
+            stats["max_lexicographical"] = pd.NA
+    return stats
+
+
 def stat_column_data(
     data_source: Union[str, dd.DataFrame],
     column_name: str,
@@ -472,13 +601,13 @@ def stat_column_data(
 
 
 if __name__ == "__main__":
-    csv_path = '/home/kido/avinasi/data_probe/dontdie-clockbase-agent/data/qced_human_dnam_age.csv'
+    csv_path = '/root/rag/task-graph/qced_human_dnam_age.csv'
 
     sample_data_points = sample_column_from_large_dataframe(csv_path, 'YingCausAge', 10000)
-    generated_fake_data = fake_data(sample_data_points, 1000)
-    column_statistics = stat_column_data(csv_path, 'YingCausAge')
+    # generated_fake_data = fake_data(sample_data_points, 1000)
+    column_statistics = _stat_column_data(sample_data_points, 1000)
     print("Column Statistics:")
     print(column_statistics)
-    print("\nGenerated Fake Data (first 10 rows):")
-    print(generated_fake_data.head(10))
+    # print("\nGenerated Fake Data (first 10 rows):")
+    # print(generated_fake_data.head(10))
     ...
